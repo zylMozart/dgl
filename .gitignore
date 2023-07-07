@@ -1,3 +1,13 @@
+# cache
+*.pt
+*.h5
+*.yaml
+*.index
+*.pkl
+*.csv
+*.txt
+*.npz
+
 # IDE
 .idea
 

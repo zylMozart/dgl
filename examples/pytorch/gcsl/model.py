@@ -59,11 +59,28 @@ class Grace(nn.Module):
         Temperature constant.
     """
 
-    def __init__(self, in_dim, hid_dim, out_dim, num_layers, act_fn, temp):
+    def __init__(self, in_dim, hid_dim, out_dim, num_layers, act_fn, temp, max_khop, num_nodes, alpha, ranking_type):
         super(Grace, self).__init__()
         self.encoder = GCN(in_dim, hid_dim, act_fn, num_layers)
         self.temp = temp
         self.proj = MLP(hid_dim, out_dim)
+        self.max_khop = max_khop
+        self.khops = None
+        self.alpha = alpha
+        self.ranking_type = ranking_type
+
+    def get_khop_neighbors(self, graph):
+        adj = graph.adj().to_dense().fill_diagonal_(1).float()
+        self.khops = th.zeros((self.max_khop,len(adj),len(adj)))
+        kadj = th.zeros((self.max_khop,len(adj),len(adj)))
+        kadj[0] = adj
+        self.khops[0] = adj.fill_diagonal_(0)
+        for i in range(1,self.max_khop): 
+            kadj[i] = th.mm(kadj[i-1],adj)
+            kadj[i][kadj[i]!=0] = 1
+            self.khops[i] = kadj[i]-kadj[i-1]
+        # for i in range(self.max_khop):
+        #     self.khops[i] = F.normalize(self.khops[i],1,1)
 
     def sim(self, z1, z2):
         # normalize embeddings across feature dimension
@@ -73,18 +90,60 @@ class Grace(nn.Module):
         s = th.mm(z1, z2.t())
         return s
 
-    def get_loss(self, z1, z2):
-        # calculate SimCLR loss
+    def get_loss(self, z):
+
         f = lambda x: th.exp(x / self.temp)
+        z_sim = f(self.sim(z, z))
+        # return z_sim.sum()
+    
+        khop_sim = []
+        for i in range(self.max_khop): 
+            khop_sim.append(th.mul(z_sim,self.khops[i]).sum(dim=0))
+        # return khop_sim[0].sum()+khop_sim[1].sum()+khop_sim[2].sum()
+    
+        loss_sum = 0
+        if self.ranking_type=="pair":
+            # Gated Pair-Wise
+            for i in range(self.max_khop):
+                for j in range(i+1,self.max_khop):
+                    idx_nonzero = th.logical_and(khop_sim[i]!=0,khop_sim[j]!=0)
+                    loss = th.div((khop_sim[i][idx_nonzero]),(khop_sim[i][idx_nonzero]+khop_sim[j][idx_nonzero]))
+                    loss_sum += -th.log(loss[loss<self.alpha]).sum()
+        elif self.ranking_type=="list":
+            # Gated List-Wise
+            for i in range(self.max_khop):
+                idx_nonzero = (khop_sim[i]!=0)
+                for j in range(i+1,self.max_khop): idx_nonzero = th.logical_and(idx_nonzero,khop_sim[j]!=0)
+                neg_term = khop_sim[i][idx_nonzero]
+                for j in range(i+1,self.max_khop): neg_term += khop_sim[j][idx_nonzero]
+                loss = th.div(khop_sim[i][idx_nonzero],neg_term)
+                loss_sum += -th.log(loss[loss<self.alpha]).sum()
 
-        refl_sim = f(self.sim(z1, z1))  # intra-view pairs
-        between_sim = f(self.sim(z1, z2))  # inter-view pairs
+                # loss = -th.log(th.div((khop_sim[i]),(khop_sim[i]+khop_sim[j])))
+                # for q in range(len(loss)):
+                #     if not th.isnan(loss[q]):
+                #         loss_min = min(loss[q],self.alpha)
+                #         loss_sum += loss_min
+                # loss = min(loss[th.logical_not(th.isnan(loss))],self.alpha)
+                # # loss[loss>self.alpha] = self.alpha
+                # loss_sum += loss.sum()
 
-        # between_sim.diag(): positive pairs
-        x1 = refl_sim.sum(1) + between_sim.sum(1) - refl_sim.diag()
-        loss = -th.log(between_sim.diag() / x1)
+                # for q in range(len(z_sim)):
+                #     loss = -th.log(th.div((khop_sim[i][q]),(khop_sim[i][q]+khop_sim[j][q])))
+                #     if not th.isnan(loss):
+                #         loss_min = min(loss,self.alpha)
+                #         loss_sum += loss_min
+                
+                # loss = -th.log(th.div((khop_sim[i]),(khop_sim[i]+khop_sim[j])))
+                # for q in range(len(loss)):
+                #     if (not th.isnan(loss[q])) and loss[q]<1 and loss[q]>1e-2:
+                #         loss_sum+=loss[q]
+                        # break
+                # loss = th.nan_to_num(loss, nan=0)
+                # loss[loss>self.alpha] = 0
+                # loss_sum += loss.sum()
 
-        return loss
+        return loss_sum
 
     def get_embedding(self, graph, feat):
         # get embeddings from the model for evaluation
@@ -92,19 +151,14 @@ class Grace(nn.Module):
 
         return h.detach()
 
-    def forward(self, graph1, graph2, feat1, feat2):
+    def forward(self, graph, feat):
         # encoding
-        h1 = self.encoder(graph1, feat1)
-        h2 = self.encoder(graph2, feat2)
+        h = self.encoder(graph, feat)
 
         # projection
-        z1 = self.proj(h1)
-        z2 = self.proj(h2)
+        z = self.proj(h)
 
         # get loss
-        l1 = self.get_loss(z1, z2)
-        l2 = self.get_loss(z2, z1)
+        l = self.get_loss(z)
 
-        ret = (l1 + l2) * 0.5
-
-        return ret.mean()
+        return l
