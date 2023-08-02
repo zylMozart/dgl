@@ -1,7 +1,7 @@
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
-
+import math
 from dgl.nn import GraphConv
 
 
@@ -59,30 +59,39 @@ class Grace(nn.Module):
         Temperature constant.
     """
 
-    def __init__(self, in_dim, hid_dim, out_dim, num_layers, act_fn, temp):
+    def __init__(self, in_dim, hid_dim, out_dim, num_layers, act_fn, temp, margin):
         super(Grace, self).__init__()
         self.encoder = GCN(in_dim, hid_dim, act_fn, num_layers)
         self.temp = temp
         self.proj = MLP(hid_dim, out_dim)
+        self.eps = 1e-5
+        self.margin = margin
 
     def sim(self, z1, z2):
         # normalize embeddings across feature dimension
         z1 = F.normalize(z1)
         z2 = F.normalize(z2)
 
-        s = th.mm(z1, z2.t())
+        s = th.mm(z1, z2.t())-self.eps
         return s
-
+    
+    def sim_arcface(self, z1, z2):
+        # normalize embeddings across feature dimension
+        z1 = F.normalize(z1)
+        z2 = F.normalize(z2)
+        cos = th.mm(z1, z2.t())-self.eps
+        sin = th.sqrt(1-th.pow(cos,2))
+        return cos*math.cos(self.margin)-sin*math.sin(self.margin)
+    
     def get_loss(self, z1, z2):
         # calculate SimCLR loss
         f = lambda x: th.exp(x / self.temp)
 
-        refl_sim = f(self.sim(z1, z1))  # intra-view pairs
+        refl_sim = f(self.sim_arcface(z1, z1))  # intra-view pairs
         between_sim = f(self.sim(z1, z2))  # inter-view pairs
 
         # between_sim.diag(): positive pairs
         x1 = refl_sim.sum(1) + between_sim.sum(1) - refl_sim.diag()
-        # x1 = (refl_sim*negative_mask).sum(1) + (between_sim*negative_mask).sum(1) - refl_sim.diag()
         loss = -th.log(between_sim.diag() / x1)
 
         return loss

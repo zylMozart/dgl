@@ -4,15 +4,13 @@ import warnings
 import numpy as np
 import torch as th
 import torch.nn as nn
-from aug import aug,knn_aug,no_aug,cos_sim_aug,Fuse,cos_combine,knn_combine
+from aug import aug,knn_aug,no_aug,cos_sim_aug
 from dataset import load
 from eval import label_classification
 from model import Grace
 from tqdm import tqdm
+import datetime
 import pandas as pd
-import os
-from datetime import datetime
-
 warnings.filterwarnings("ignore")
 
 
@@ -24,14 +22,10 @@ def count_parameters(model):
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument("--aug_type", type=str, default="knn_combine",help="knn, cos, fuse")
-parser.add_argument("--knn_clusters", type=int, default=5)
-parser.add_argument("--cos_topk", type=float, default=0.1)
-parser.add_argument("--fuse_rate", type=float, default=0.6)
-parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--margin", type=float, default=0.1, help="Margin for ArcFace.")
 
 parser.add_argument("--dataname", type=str, default="cora")
-parser.add_argument("--gpu", type=int, default=2)
+parser.add_argument("--gpu", type=int, default=0)
 parser.add_argument("--split", type=str, default="public")
 
 parser.add_argument(
@@ -98,7 +92,7 @@ def seed_everything(seed):
 
 if __name__ == "__main__":
     # Step 1: Load hyperparameters =================================================================== #
-    seed_everything(args.seed)
+    seed_everything(0)
     lr = args.lr
     hid_dim = args.hid_dim
     out_dim = args.out_dim
@@ -120,41 +114,19 @@ if __name__ == "__main__":
     in_dim = feat.shape[1]
 
     # Step 3: Create model =================================================================== #
-    model = Grace(in_dim, hid_dim, out_dim, num_layers, act_fn, temp)
+    model = Grace(in_dim, hid_dim, out_dim, num_layers, act_fn, temp, args.margin)
     model = model.to(args.device)
     print(f"# params: {count_parameters(model)}")
 
     optimizer = th.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
     # Step 4: Training =======================================================================
-    if args.aug_type=='knn':
-        graph1, feat1 = knn_aug(feat, args.knn_clusters)
-    elif args.aug_type=='cos':
-        graph1, feat1 = cos_sim_aug(feat, args.cos_topk)
-    elif args.aug_type=='':
-        graph1, feat1 = aug(graph, feat, drop_feature_rate_1, drop_edge_rate_1)
-    elif 'fuse' in args.aug_type:
-        fuse = Fuse(graph, feat, args)
-    elif args.aug_type=='cos_guided':
-        feat_graph, _ = cos_sim_aug(feat, args.cos_topk)
-        negative_mask = 1 - feat_graph.adj().to_dense()
-        negative_mask = negative_mask.to(args.device)
-    elif args.aug_type=='knn_guided':
-        feat_graph, _ = knn_aug(feat, args.knn_clusters)
-        negative_mask = 1 - feat_graph.adj().to_dense()
-        negative_mask = negative_mask.to(args.device)
-    elif args.aug_type=='cos_combine':
-        graph = cos_combine(graph, feat, args.cos_topk)
-    elif args.aug_type=='knn_combine':
-        graph = knn_combine(graph, feat, args.knn_clusters)
     bar = tqdm(range(epochs))
     for epoch in bar:
         model.train()
         optimizer.zero_grad()
         graph1, feat1 = aug(graph, feat, drop_feature_rate_1, drop_edge_rate_1)
         graph2, feat2 = aug(graph, feat, drop_feature_rate_2, drop_edge_rate_2)
-        # if 'fuse' in args.aug_type:
-        #     graph1, feat1, graph2, feat2 = fuse.aug_fuse(graph, feat, drop_feature_rate_1, drop_edge_rate_1)
 
         graph1 = graph1.to(args.device)
         graph2 = graph2.to(args.device)
@@ -163,11 +135,10 @@ if __name__ == "__main__":
         feat2 = feat2.to(args.device)
 
         loss = model(graph1, graph2, feat1, feat2)
-        # loss = model(graph1, graph2, feat1, feat2, negative_mask)
         loss.backward()
         optimizer.step()
 
-        bar.set_description(f"Dataset: {args.dataname}")
+        bar.set_description(f"Dataset: {args.dataname} m:{args.margin}")
         bar.set_postfix(loss=loss.item())
     
     # Step 5: Linear evaluation ============================================================== #
@@ -183,16 +154,18 @@ if __name__ == "__main__":
         embeds, labels, train_mask, test_mask, split=args.split
     )
 
-    result={}
-    for k,v in test_result.items():
-        for k2,v2 in v.items():
-            result[k+k2]=v2
-    result.update(vars(args))
-    result['datetime'] = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
-    df = pd.DataFrame(columns=result.keys())
-    df = df.append(result, ignore_index=True)
-    save_path = 'zyl_implement/result/grace_graph_combine.csv'
-    if os.path.exists(save_path):
-        df.to_csv(save_path,mode='a',header=False) 
-    else:
-        df.to_csv(save_path,mode='w',header=True) 
+    # Record result with parameters
+    e = datetime.datetime.now()
+    df = pd.DataFrame(columns=['time','method','dataset','margin','temp','hid_dim','out_dim','F1Mi_mean','F1Mi_std','F1Ma_mean','F1Ma_std'])
+    df = df.append({'time':"%s/%s/%s %s:%s:%s"%(e.day,e.month,e.year,e.hour,e.minute,e.second),
+                'method':'grace_arcface',
+               'dataset':args.dataname,
+               'margin':args.margin,
+               'temp':args.temp,
+               'hid_dim':args.hid_dim,
+               'out_dim':args.out_dim,
+               'F1Mi_mean':test_result['F1Mi']['mean'],
+               'F1Mi_std':test_result['F1Mi']['std'],
+               'F1Ma_mean':test_result['F1Ma']['mean'],
+               'F1Ma_std':test_result['F1Ma']['std']},ignore_index=True)
+    df.to_csv('examples/pytorch/grace_arcface/result.csv',mode='a',header=False) 

@@ -82,7 +82,6 @@ class Grace(nn.Module):
 
         # between_sim.diag(): positive pairs
         x1 = refl_sim.sum(1) + between_sim.sum(1) - refl_sim.diag()
-        # x1 = (refl_sim*negative_mask).sum(1) + (between_sim*negative_mask).sum(1) - refl_sim.diag()
         loss = -th.log(between_sim.diag() / x1)
 
         return loss
